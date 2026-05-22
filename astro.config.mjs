@@ -46,6 +46,7 @@ export default defineConfig({
           items: [
             { slug: 'approach' },
             { slug: 'quick-start' },
+            { slug: 'external-resources' },
           ],
         },
         {
