@@ -144,13 +144,20 @@ app.all('/latest/download/:branch/:bin',
   }
 )
 
+// Same guard as the releases download route: route params can carry encoded
+// separators that decode before interpolation, so keep bin to one plain segment.
+const SAFE_SEGMENT = /^(?!\.+$)[A-Za-z0-9._-]+$/
+
 // Specific run artifacts are immutable, cache for 24 hours
-app.all('/download/runs/:run_id/:bin',
+app.all('/download/runs/:run_id{[0-9]+}/:bin',
   cache({ cacheName: 'artifacts', cacheControl: 'public, max-age=86400' }),
   async (c: Context) => {
     const run_id = parseInt(c.req.param('run_id'))
     const bin = c.req.param('bin')
     console.log({ run_id, bin })
+    if (!SAFE_SEGMENT.test(bin)) {
+      return c.json({ error: "Invalid artifact name" }, 400)
+    }
     const artifact = await fetch(`https://nightly.link/ESPresense/ESPresense/actions/runs/${run_id}/${bin}.zip`)
     if (artifact.status !== 200) {
       return c.json({ error: `Artifact not found: ${artifact.status}` }, artifact.status as any)
