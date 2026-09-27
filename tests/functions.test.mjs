@@ -111,14 +111,14 @@ test('artifacts does not route a run id with a numeric prefix', async () => {
 
 const API = 'https://api.github.com/repos/ESPresense/ESPresense'
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
-const assets = (...names) => names.map(name => ({ name, browser_download_url: `${GITHUB}/releases/download/v4.0.6/${name}` }))
 const appPaths = (manifest) => manifest.builds.map(b => `${b.chipFamily}${b.serialType ? ':' + b.serialType : ''} ${b.parts.at(-1).path}`)
 
+const release = (tag, ...names) => {
+  for (const name of names) upstream[`${GITHUB}/releases/download/${tag}/${name}`] = () => redirect('https://release-assets.example/signed')
+}
+
 test('release manifest lists a build per chip family', async () => {
-  upstream[`${API}/releases/tags/v4.0.6`] = () => json({
-    name: 'v4.0.6',
-    assets: assets('esp32.bin', 'esp32c3.bin', 'esp32c3-cdc.bin', 'esp32s3.bin', 'esp32s3-cdc.bin', 'esp32c6.bin', 'esp32c6-cdc.bin'),
-  })
+  release('v4.0.6', 'esp32.bin', 'esp32c3.bin', 'esp32c3-cdc.bin', 'esp32s3.bin', 'esp32s3-cdc.bin', 'esp32c6.bin', 'esp32c6-cdc.bin')
 
   const res = await get(releases, '/releases/v4.0.6.json')
   assert.equal(res.status, 200)
@@ -141,10 +141,7 @@ test('release manifest lists a build per chip family', async () => {
 })
 
 test('release manifest prefers flavored assets and falls back per chip', async () => {
-  upstream[`${API}/releases/tags/v4.0.6`] = () => json({
-    name: 'v4.0.6',
-    assets: assets('esp32.bin', 'esp32-verbose.bin', 'esp32c3.bin', 'm5atom.bin'),
-  })
+  release('v4.0.6', 'esp32.bin', 'esp32-verbose.bin', 'esp32c3.bin', 'm5atom.bin')
 
   const verbose = await (await get(releases, '/releases/v4.0.6.json?flavor=verbose')).json()
   assert.equal(verbose.name, 'ESPresense v4.0.6 (verbose)')
@@ -156,26 +153,59 @@ test('release manifest prefers flavored assets and falls back per chip', async (
 })
 
 test('release manifest omits chip families the release does not ship', async () => {
-  upstream[`${API}/releases/tags/v3.0.0`] = () => json({ name: 'v3.0.0', assets: assets('esp32.bin') })
+  release('v3.0.0', 'esp32.bin')
   assert.deepEqual(appPaths(await (await get(releases, '/releases/v3.0.0.json')).json()), ['ESP32 download/v3.0.0/esp32.bin'])
+})
+
+test('latest.json resolves to the newest stable release and its real tag', async () => {
+  upstream[`${GITHUB}/releases/latest`] = () => redirect(`${GITHUB}/releases/tag/v4.0.6`)
+  release('v4.0.6', 'esp32.bin', 'esp32c3.bin')
+
+  const res = await get(releases, '/releases/latest.json')
+  assert.equal(res.status, 200)
+  assert.equal(res.headers.get('Cache-Control'), 'public, max-age=300')
+  const manifest = await res.json()
+  assert.equal(manifest.version, 'v4.0.6')
+  // 'latest' is not a tag, so download paths must use the resolved one
+  assert.deepEqual(appPaths(manifest), ['ESP32 download/v4.0.6/esp32.bin', 'ESP32-C3:uart download/v4.0.6/esp32c3.bin'])
+})
+
+test('latest.json returns 502 when the alias does not resolve', async () => {
+  upstream[`${GITHUB}/releases/latest`] = () => new Response('slow down', { status: 429 })
+  const res = await get(releases, '/releases/latest.json')
+  assert.equal(res.status, 502)
+  assert.deepEqual((await res.json()).upstream, { url: `${GITHUB}/releases/latest`, status: 429 })
 })
 
 test('release manifest returns 404 for an unknown tag', async () => {
   assert.equal((await get(releases, '/releases/v0.0.0.json')).status, 404)
 })
 
-test('release manifest returns 502 when GitHub answers 429', async () => {
-  upstream[`${API}/releases/tags/v4.0.6`] = () => json({ message: 'slow down' }, 429)
-  assert.equal((await get(releases, '/releases/v4.0.6.json')).status, 502)
+test('release manifest returns 502 and names the lookup GitHub refused', async () => {
+  release('v4.0.6', 'esp32.bin')
+  upstream[`${GITHUB}/releases/download/v4.0.6/esp32c3.bin`] = () => new Response('slow down', { status: 429 })
+
+  const res = await get(releases, '/releases/v4.0.6.json')
+  assert.equal(res.status, 502)
+  assert.deepEqual((await res.json()).upstream, { url: `${GITHUB}/releases/download/v4.0.6/esp32c3.bin`, status: 429 })
 })
 
-test('release manifest returns 502 when GitHub answers 403', async () => {
-  upstream[`${API}/releases/tags/v4.0.6`] = () => json({ message: 'rate limit exceeded' }, 403)
-  assert.equal((await get(releases, '/releases/v4.0.6.json')).status, 502)
+test('release manifest never calls the rate-limited GitHub API', async () => {
+  upstream[`${GITHUB}/releases/latest`] = () => redirect(`${GITHUB}/releases/tag/v4.0.6`)
+  release('v4.0.6', 'esp32.bin')
+  await get(releases, '/releases/latest.json')
+  await get(releases, '/releases/v4.0.6.json?flavor=verbose')
+  assert.ok(fetched.length > 0)
+  assert.ok(fetched.every(url => !url.includes('api.github.com')), fetched.join('\n'))
 })
 
 test('release manifest rejects encoded separators in the tag', async () => {
   assert.equal((await get(releases, '/releases/a%2F..%2F..%2Fb.json')).status, 400)
+  assert.deepEqual(fetched, [])
+})
+
+test('release manifest rejects an unsafe flavor', async () => {
+  assert.equal((await get(releases, '/releases/v4.0.6.json?flavor=..%2F..%2Fx')).status, 400)
   assert.deepEqual(fetched, [])
 })
 
@@ -200,9 +230,9 @@ test('tagged download returns 502 when GitHub fails', async () => {
   assert.equal((await get(releases, '/releases/download/v4.0.6/esp32.bin')).status, 502)
 })
 
-test('release manifest returns 502 for a malformed GitHub response', async () => {
-  upstream[`${API}/releases/tags/v4.0.6`] = () => new Response('<html>oops</html>')
-  assert.equal((await get(releases, '/releases/v4.0.6.json')).status, 502)
+test('run manifest returns 502 for a malformed GitHub response', async () => {
+  upstream[`${API}/actions/runs/123/artifacts`] = () => new Response('<html>oops</html>')
+  assert.equal((await get(artifacts, '/artifacts/123.json')).status, 502)
 })
 
 test('tagged download returns 404 for a missing asset', async () => {
@@ -353,3 +383,124 @@ for (const handler of [releases, artifacts]) {
     assert.equal((await get(handler, path)).headers.get('Access-Control-Allow-Origin'), '*')
   })
 }
+
+// --- last good answer is served when GitHub fails ---------------------------
+
+import { afterEach } from 'node:test'
+
+// Minimal stand-in for the Workers Cache API
+const edgeCache = () => {
+  const entries = new Map()
+  return {
+    entries,
+    match: async (req) => entries.get(req.url)?.clone(),
+    put: async (req, res) => { entries.set(req.url, res.clone()) },
+  }
+}
+const realNow = Date.now
+afterEach(() => {
+  delete globalThis.caches
+  Date.now = realNow
+})
+const minutesLater = (n) => { const at = realNow() + n * 60_000; Date.now = () => at }
+const send = (handler, path, method) => handler({
+  request: new Request('https://espresense.com' + path, { method }),
+  env: {}, params: {}, waitUntil() {}, passThroughOnException() {},
+  next: () => new Response(null, { status: 404 }),
+})
+
+test('update check keeps answering from the last good redirect when GitHub fails', async () => {
+  globalThis.caches = { default: edgeCache() }
+  const tagged = `${GITHUB}/releases/download/v4.1.0b0/esp32c3.bin`
+  upstream[`${GITHUB}/releases.atom`] = () => new Response(feed('v4.1.0b0'))
+  upstream[tagged] = () => redirect('https://release-assets.example/signed')
+  assert.equal((await send(releases, '/releases/latest-any/download/esp32c3.bin', 'HEAD')).status, 302)
+
+  minutesLater(10)
+  upstream[`${GITHUB}/releases.atom`] = () => new Response('slow down', { status: 429 })
+
+  const res = await send(releases, '/releases/latest-any/download/esp32c3.bin', 'HEAD')
+  assert.equal(res.status, 302)
+  assert.equal(res.headers.get('Location'), tagged)
+  assert.equal(res.headers.get('X-Release-Cache'), 'STALE')
+  assert.equal(res.headers.get('Cache-Control'), 'no-store')
+})
+
+test('fresh answers are served without asking GitHub again', async () => {
+  globalThis.caches = { default: edgeCache() }
+  upstream[`${GITHUB}/releases.atom`] = () => new Response(feed('v4.1.0b0'))
+  upstream[`${GITHUB}/releases/download/v4.1.0b0/esp32.bin`] = () => redirect('https://release-assets.example/signed')
+  await get(releases, '/releases/latest-any/download/esp32.bin')
+  const asked = fetched.length
+
+  minutesLater(4)
+  const res = await send(releases, '/releases/latest-any/download/esp32.bin', 'HEAD')
+  assert.equal(res.status, 302)
+  assert.equal(res.headers.get('Cache-Control'), 'public, max-age=300')
+  assert.equal(res.headers.get('X-Release-Cache'), 'HIT')
+  assert.equal(res.headers.get('X-Stored-At'), null)
+  assert.equal(fetched.length, asked)
+})
+
+test('a new release is picked up once the answer is no longer fresh', async () => {
+  globalThis.caches = { default: edgeCache() }
+  upstream[`${GITHUB}/releases.atom`] = () => new Response(feed('v4.1.0b0'))
+  upstream[`${GITHUB}/releases/download/v4.1.0b0/esp32.bin`] = () => redirect('https://release-assets.example/a')
+  await get(releases, '/releases/latest-any/download/esp32.bin')
+
+  minutesLater(6)
+  upstream[`${GITHUB}/releases.atom`] = () => new Response(feed('v4.2.0', 'v4.1.0b0'))
+  upstream[`${GITHUB}/releases/download/v4.2.0/esp32.bin`] = () => redirect('https://release-assets.example/b')
+
+  const res = await get(releases, '/releases/latest-any/download/esp32.bin')
+  assert.equal(res.headers.get('Location'), `${GITHUB}/releases/download/v4.2.0/esp32.bin`)
+})
+
+test('manifest keeps answering from the last good copy when GitHub fails', async () => {
+  globalThis.caches = { default: edgeCache() }
+  upstream[`${GITHUB}/releases/latest`] = () => redirect(`${GITHUB}/releases/tag/v4.0.6`)
+  release('v4.0.6', 'esp32.bin')
+  const good = await (await get(releases, '/releases/latest.json')).json()
+
+  minutesLater(10)
+  upstream[`${GITHUB}/releases/latest`] = () => new Response('boom', { status: 503 })
+
+  const res = await get(releases, '/releases/latest.json')
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), good)
+})
+
+test('run manifest falls back to the last good copy when the handler throws', async () => {
+  globalThis.caches = { default: edgeCache() }
+  upstream[`${API}/actions/runs/123/artifacts`] = () => json(artifactList('esp32.bin'))
+  const good = await (await get(artifacts, '/artifacts/123.json')).json()
+
+  minutesLater(60 * 25)
+  upstream[`${API}/actions/runs/123/artifacts`] = () => new Response('<html>oops</html>')
+
+  const res = await get(artifacts, '/artifacts/123.json')
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), good)
+})
+
+test('failures and missing files are never stored as the last good answer', async () => {
+  const cache = edgeCache()
+  globalThis.caches = { default: cache }
+  upstream[`${GITHUB}/releases.atom`] = () => new Response('slow down', { status: 429 })
+  assert.equal((await get(releases, '/releases/latest-any/download/esp32.bin')).status, 502)
+  assert.equal((await get(releases, '/releases/download/v4.0.6/nope.bin')).status, 404)
+  assert.equal((await get(releases, '/releases/latest/download/a%2F..%2Fb')).status, 400)
+  assert.equal(cache.entries.size, 0)
+})
+
+test('tagged download serves the cached firmware image intact', async () => {
+  globalThis.caches = { default: edgeCache() }
+  const image = new Uint8Array([0xe9, 1, 2, 3])
+  upstream[`${GITHUB}/releases/download/v4.0.6/esp32.bin`] = () => new Response(image, { headers: { 'Content-Type': 'application/octet-stream' } })
+  assert.deepEqual(new Uint8Array(await (await get(releases, '/releases/download/v4.0.6/esp32.bin')).arrayBuffer()), image)
+
+  upstream[`${GITHUB}/releases/download/v4.0.6/esp32.bin`] = () => new Response('boom', { status: 500 })
+  const res = await get(releases, '/releases/download/v4.0.6/esp32.bin')
+  assert.equal(res.status, 200)
+  assert.deepEqual(new Uint8Array(await res.arrayBuffer()), image)
+})
